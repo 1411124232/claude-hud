@@ -1,5 +1,5 @@
 import type { SessionTokenUsage, StdinData } from './types.js';
-import { isBedrockModelId } from './stdin.js';
+import { isBedrockModelId, isVertexModelId } from './stdin.js';
 
 type ModelPricing = {
   inputUsdPerMillion: number;
@@ -91,6 +91,10 @@ export function estimateSessionCost(
     return null;
   }
 
+  if (isVertexModelId(stdin.model?.id)) {
+    return null;
+  }
+
   const pricing = getAnthropicPricing(stdin);
   if (!pricing) {
     return null;
@@ -125,6 +129,10 @@ function getNativeCostUsd(stdin: StdinData): number | null {
   }
 
   if (isBedrockModelId(stdin.model?.id)) {
+    return null;
+  }
+
+  if (isVertexModelId(stdin.model?.id)) {
     return null;
   }
 

@@ -1,4 +1,4 @@
-import { isBedrockModelId } from './stdin.js';
+import { isBedrockModelId, isVertexModelId } from './stdin.js';
 const TOKENS_PER_MILLION = 1_000_000;
 const CACHE_WRITE_MULTIPLIER = 1.25;
 const CACHE_READ_MULTIPLIER = 0.1;
@@ -57,6 +57,9 @@ export function estimateSessionCost(stdin, sessionTokens) {
     if (isBedrockModelId(stdin.model?.id)) {
         return null;
     }
+    if (isVertexModelId(stdin.model?.id)) {
+        return null;
+    }
     const pricing = getAnthropicPricing(stdin);
     if (!pricing) {
         return null;
@@ -86,6 +89,9 @@ function getNativeCostUsd(stdin) {
         return null;
     }
     if (isBedrockModelId(stdin.model?.id)) {
+        return null;
+    }
+    if (isVertexModelId(stdin.model?.id)) {
         return null;
     }
     return nativeCost;
