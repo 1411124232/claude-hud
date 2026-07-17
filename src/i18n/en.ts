@@ -2,7 +2,7 @@ import type { Messages } from "./types.js";
 
 export const en: Messages = {
   // Labels
-  "label.context": "Context",
+  "label.context": "Ctx",
   "label.usage": "Usage",
   "label.weekly": "Weekly",
   "label.approxRam": "Approx RAM",
