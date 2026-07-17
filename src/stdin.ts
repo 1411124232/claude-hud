@@ -224,6 +224,13 @@ export function getBufferedPercent(stdin: StdinData, autoCompactWindow?: number 
   return Math.min(100, Math.round(((totalTokens + buffer) / size) * 100));
 }
 
+const ENV_MODEL_MAP: Record<string, string> = {
+  ANTHROPIC_DEFAULT_FABLE_MODEL: 'ANTHROPIC_DEFAULT_FABLE_MODEL_NAME',
+  ANTHROPIC_DEFAULT_HAIKU_MODEL: 'ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME',
+  ANTHROPIC_DEFAULT_OPUS_MODEL: 'ANTHROPIC_DEFAULT_OPUS_MODEL_NAME',
+  ANTHROPIC_DEFAULT_SONNET_MODEL: 'ANTHROPIC_DEFAULT_SONNET_MODEL_NAME',
+};
+
 // Enterprise plan alias → human-readable display name
 const ENTERPRISE_ALIAS_LABELS: Record<string, string> = {
   opusplan: 'Claude Opus',
@@ -232,12 +239,25 @@ const ENTERPRISE_ALIAS_LABELS: Record<string, string> = {
 };
 
 export function getModelName(stdin: StdinData): string {
+  const modelId = stdin.model?.id?.trim();
+
+  if (modelId) {
+    for (const [idEnv, nameEnv] of Object.entries(ENV_MODEL_MAP)) {
+      if (process.env[idEnv]?.trim() === modelId) {
+        const envDisplayName = process.env[nameEnv]?.trim();
+        if (envDisplayName) {
+          return envDisplayName;
+        }
+        break;
+      }
+    }
+  }
+
   const displayName = stdin.model?.display_name?.trim();
   if (displayName) {
     return displayName;
   }
 
-  const modelId = stdin.model?.id?.trim();
   if (!modelId) {
     return 'Unknown';
   }

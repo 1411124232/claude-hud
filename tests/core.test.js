@@ -320,6 +320,47 @@ test('getModelName precedence: trimmed display name, then normalized bedrock lab
   assert.equal(getModelName({}), 'Unknown');
 });
 
+test('getModelName uses configured display-name aliases for matching model ids', () => {
+  const envKeys = [
+    'ANTHROPIC_DEFAULT_FABLE_MODEL',
+    'ANTHROPIC_DEFAULT_FABLE_MODEL_NAME',
+    'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+    'ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME',
+    'ANTHROPIC_DEFAULT_OPUS_MODEL',
+    'ANTHROPIC_DEFAULT_OPUS_MODEL_NAME',
+    'ANTHROPIC_DEFAULT_SONNET_MODEL',
+    'ANTHROPIC_DEFAULT_SONNET_MODEL_NAME',
+  ];
+  const originalEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+
+  try {
+    const cases = [
+      ['ANTHROPIC_DEFAULT_FABLE_MODEL', 'ANTHROPIC_DEFAULT_FABLE_MODEL_NAME', 'fable-id', 'Fable Alias'],
+      ['ANTHROPIC_DEFAULT_HAIKU_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME', 'haiku-id', 'Haiku Alias'],
+      ['ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL_NAME', 'opus-id', 'Opus Alias'],
+      ['ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL_NAME', 'sonnet-id', 'Sonnet Alias'],
+    ];
+
+    for (const [idEnv, nameEnv, modelId, alias] of cases) {
+      process.env[idEnv] = modelId;
+      process.env[nameEnv] = alias;
+      assert.equal(getModelName({ model: { id: modelId, display_name: 'Claude Default' } }), alias);
+    }
+
+    delete process.env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME;
+    assert.equal(getModelName({ model: { id: 'sonnet-id', display_name: 'Claude Default' } }), 'Claude Default');
+    assert.equal(getModelName({ model: { id: 'other-id', display_name: 'Claude Other' } }), 'Claude Other');
+  } finally {
+    for (const key of envKeys) {
+      if (originalEnv[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = originalEnv[key];
+      }
+    }
+  }
+});
+
 test('stripContextSuffix removes parenthetical context-window info', () => {
   assert.equal(stripContextSuffix('Opus 4.6 (1M context)'), 'Opus 4.6');
   assert.equal(stripContextSuffix('Sonnet 4 (200k context)'), 'Sonnet 4');
