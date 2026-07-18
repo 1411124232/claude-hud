@@ -19,7 +19,7 @@ import {
   renderCompactionsLine,
   renderSessionTimeLine,
 } from './lines/index.js';
-import { dim, RESET } from './colors.js';
+import { dim, label, RESET } from './colors.js';
 import { getTerminalWidth, UNKNOWN_TERMINAL_WIDTH } from '../utils/terminal.js';
 import { codePointCellWidth, isCjkAmbiguousWide } from './width.js';
 import type { ProgressLabelOptions } from './lines/label-align.js';
@@ -560,6 +560,12 @@ export function render(ctx: RenderContext): void {
     const renderedLines = renderExpanded(ctx, terminalWidth);
     lines = renderedLines.map(({ line }) => line);
 
+    const duration =
+      ctx.config?.display?.showDuration === true && ctx.sessionDuration
+        ? `${label('⏱️ ', ctx.config?.colors)}` +
+          `\x1b[38;5;240m${ctx.sessionDuration}${RESET}`
+        : null;
+
     // Session token usage (cumulative), appended to line 1 when it fits
     if (ctx.config?.display?.showSessionTokens) {
       const sessionTokensLine = renderSessionTokensLine(ctx);
@@ -570,6 +576,15 @@ export function render(ctx: RenderContext): void {
         } else {
           lines.push(sessionTokensLine);
         }
+      }
+    }
+
+    // Duration always goes last on line 1
+    if (duration) {
+      if (lines.length > 0) {
+        lines[0] = `${lines[0]} ${dim('|')} ${duration}`;
+      } else {
+        lines.push(duration);
       }
     }
 

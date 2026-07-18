@@ -18,6 +18,11 @@ export function formatSessionTokenSummary(
 ): string | null {
   const total = tokens.inputTokens + tokens.outputTokens + tokens.cacheCreationTokens + tokens.cacheReadTokens;
 
+  const inputTotal = tokens.inputTokens + tokens.cacheCreationTokens + tokens.cacheReadTokens;
+  const hitPercent = tokens.cacheReadTokens > 0
+    ? Math.round((tokens.cacheReadTokens / inputTotal) * 1000) / 10
+    : null;
+
   const parts: string[] = [];
   if (tokens.inputTokens > 0) {
     parts.push(`${TEAL}${t('format.in')}${RESET} ${GRAY}${formatTokens(tokens.inputTokens)}${RESET}`);
@@ -29,17 +34,14 @@ export function formatSessionTokenSummary(
     parts.push(`${TEAL}C·W${RESET} ${GRAY}${formatTokens(tokens.cacheCreationTokens)}${RESET}`);
   }
   if (tokens.cacheReadTokens > 0) {
-    const inputTotal = tokens.inputTokens + tokens.cacheCreationTokens + tokens.cacheReadTokens;
-    const hitPercent = Math.round((tokens.cacheReadTokens / inputTotal) * 1000) / 10;
-    parts.push(
-      `${TEAL}C·R${RESET} ${GRAY}${formatTokens(tokens.cacheReadTokens)} ` +
-      `(${hitPctColor(hitPercent)}${hitPercent}%${RESET}${GRAY})${RESET}`,
-    );
+    parts.push(`${TEAL}C·R${RESET} ${GRAY}${formatTokens(tokens.cacheReadTokens)}${RESET}`);
   }
 
-  const head = `${TEAL}${prefix}${RESET} ${GRAY}${formatTokens(total)}${RESET}`;
+  const head =
+    `${TEAL}${prefix}${RESET} ${GRAY}${formatTokens(total)}${RESET}` +
+    (hitPercent !== null ? ` ${hitPctColor(hitPercent)}${hitPercent}%${RESET}` : '');
   return parts.length > 0
-    ? `${head} [${parts.join(', ')}]`
+    ? `${head} (${parts.join(', ')})`
     : head;
 }
 
