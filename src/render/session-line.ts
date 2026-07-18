@@ -316,7 +316,7 @@ export function renderSessionLine(ctx: RenderContext): string {
   if (display?.showSessionTokens && ctx.transcript.sessionTokens) {
     const summary = formatSessionTokenSummary(ctx.transcript.sessionTokens, `${t('format.tok')}:`);
     if (summary) {
-      parts.push(label(summary, colors));
+      parts.push(summary);
     }
   }
 
@@ -338,7 +338,7 @@ export function renderSessionLine(ctx: RenderContext): string {
   }
 
   if (display?.showDuration === true && ctx.sessionDuration) {
-    parts.push(label(`⏱️ ${ctx.sessionDuration}`, colors));
+    parts.push(`${label('⏱️ ', colors)}\x1b[38;5;240m${ctx.sessionDuration}${RESET}`);
   }
 
   const sessionTimeLine = renderSessionTimeLine(ctx);

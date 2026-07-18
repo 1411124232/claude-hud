@@ -7,7 +7,6 @@ import { coloredBar, label, getContextColor, RESET } from "../colors.js";
 import { getAdaptiveBarWidth } from "../../utils/terminal.js";
 import { t } from "../../i18n/index.js";
 import {
-  progressLabel,
   type ProgressLabelInput,
 } from "./label-align.js";
 import { formatTokens, formatContextValue } from "../../utils/format.js";
@@ -41,10 +40,12 @@ export function renderIdentityLine(
   const contextValue = formatContextValue(ctx, percent, contextValueMode);
   const contextValueDisplay = `${getContextColor(percent, colors, contextThresholds)}${contextValue}${RESET}`;
 
+  const contextLabel = `\x1b[38;5;73m${t("label.context")}${RESET}`;
+
   let line =
     display?.showContextBar !== false
-      ? `${progressLabel("label.context", colors, labelOptions)} ${coloredBar(percent, getAdaptiveBarWidth(), colors, contextThresholds)} ${contextValueDisplay}`
-      : `${progressLabel("label.context", colors, labelOptions)} ${contextValueDisplay}`;
+      ? `${contextLabel} ${coloredBar(percent, getAdaptiveBarWidth(), colors, contextThresholds)} ${contextValueDisplay}`
+      : `${contextLabel} ${contextValueDisplay}`;
 
   if (display?.showTokenBreakdown !== false && percent >= (display?.contextCriticalThreshold ?? 85)) {
     const usage = ctx.stdin.context_window?.current_usage;

@@ -67,5 +67,5 @@ export function renderSessionTimeLine(ctx: RenderContext, nowFn?: () => number):
     return null;
   }
 
-  return parts.join(` ${label('│', colors)} `);
+  return parts.join(` ${label('|', colors)} `);
 }

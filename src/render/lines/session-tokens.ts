@@ -1,7 +1,10 @@
 import type { RenderContext } from '../../types.js';
-import { label } from '../colors.js';
+import { RESET } from '../colors.js';
 import { t } from '../../i18n/index.js';
 import { formatTokens } from '../../utils/format.js';
+
+const TEAL = '\x1b[38;5;73m';
+const GRAY = '\x1b[38;5;243m';
 
 export function formatSessionTokenSummary(
   tokens: NonNullable<RenderContext['transcript']['sessionTokens']>,
@@ -11,21 +14,22 @@ export function formatSessionTokenSummary(
 
   const parts: string[] = [];
   if (tokens.inputTokens > 0) {
-    parts.push(`${t('format.in')}: ${formatTokens(tokens.inputTokens)}`);
+    parts.push(`${TEAL}${t('format.in')}${RESET} ${GRAY}${formatTokens(tokens.inputTokens)}${RESET}`);
   }
   if (tokens.outputTokens > 0) {
-    parts.push(`${t('format.out')}: ${formatTokens(tokens.outputTokens)}`);
+    parts.push(`${TEAL}${t('format.out')}${RESET} ${GRAY}${formatTokens(tokens.outputTokens)}${RESET}`);
   }
   if (tokens.cacheCreationTokens > 0) {
-    parts.push(`C·W: ${formatTokens(tokens.cacheCreationTokens)}`);
+    parts.push(`${TEAL}C·W${RESET} ${GRAY}${formatTokens(tokens.cacheCreationTokens)}${RESET}`);
   }
   if (tokens.cacheReadTokens > 0) {
-    parts.push(`C·R: ${formatTokens(tokens.cacheReadTokens)}`);
+    parts.push(`${TEAL}C·R${RESET} ${GRAY}${formatTokens(tokens.cacheReadTokens)}${RESET}`);
   }
 
+  const head = `${TEAL}${prefix}${RESET} ${GRAY}${formatTokens(total)}${RESET}`;
   return parts.length > 0
-    ? `${prefix} ${formatTokens(total)} (${parts.join(', ')})`
-    : `${prefix} ${formatTokens(total)}`;
+    ? `${head} [${parts.join(', ')}]`
+    : head;
 }
 
 export function renderSessionTokensLine(ctx: RenderContext): string | null {
@@ -39,7 +43,5 @@ export function renderSessionTokensLine(ctx: RenderContext): string | null {
     return null;
   }
 
-  const colors = ctx.config?.colors;
-  const summary = formatSessionTokenSummary(tokens, t('label.tokens'));
-  return summary ? label(summary, colors) : null;
+  return formatSessionTokenSummary(tokens, t('label.tokens'));
 }

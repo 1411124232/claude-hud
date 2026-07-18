@@ -485,7 +485,7 @@ function renderExpanded(ctx: RenderContext, terminalWidth: number | null = null)
           );
 
         if (renderedGroupLines.length > 1) {
-          const combinedLine = renderedGroupLines.map(({ line }) => line).join(' │ ');
+          const combinedLine = renderedGroupLines.map(({ line }) => line).join(` ${dim('|')} `);
           const widthIsReal = terminalWidth !== UNKNOWN_TERMINAL_WIDTH;
           const canCombine = !widthIsReal || visualLength(combinedLine) <= terminalWidth;
 
@@ -564,7 +564,7 @@ export function render(ctx: RenderContext): void {
     if (ctx.config?.display?.showSessionTokens) {
       const sessionTokensLine = renderSessionTokensLine(ctx);
       if (sessionTokensLine) {
-        const combined = lines.length > 0 ? `${lines[0]} │ ${sessionTokensLine}` : null;
+        const combined = lines.length > 0 ? `${lines[0]} ${dim('|')} ${sessionTokensLine}` : null;
         if (combined && (terminalWidth === UNKNOWN_TERMINAL_WIDTH || visualLength(combined) <= terminalWidth)) {
           lines[0] = combined;
         } else {
