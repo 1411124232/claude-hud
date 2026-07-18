@@ -560,11 +560,16 @@ export function render(ctx: RenderContext): void {
     const renderedLines = renderExpanded(ctx, terminalWidth);
     lines = renderedLines.map(({ line }) => line);
 
-    // Session token usage (cumulative)
+    // Session token usage (cumulative), appended to line 1 when it fits
     if (ctx.config?.display?.showSessionTokens) {
       const sessionTokensLine = renderSessionTokensLine(ctx);
       if (sessionTokensLine) {
-        lines.push(sessionTokensLine);
+        const combined = lines.length > 0 ? `${lines[0]} │ ${sessionTokensLine}` : null;
+        if (combined && (terminalWidth === UNKNOWN_TERMINAL_WIDTH || visualLength(combined) <= terminalWidth)) {
+          lines[0] = combined;
+        } else {
+          lines.push(sessionTokensLine);
+        }
       }
     }
 

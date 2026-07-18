@@ -8,20 +8,24 @@ export function formatSessionTokenSummary(
   prefix: string,
 ): string | null {
   const total = tokens.inputTokens + tokens.outputTokens + tokens.cacheCreationTokens + tokens.cacheReadTokens;
-  if (total === 0) {
-    return null;
+
+  const parts: string[] = [];
+  if (tokens.inputTokens > 0) {
+    parts.push(`${t('format.in')}: ${formatTokens(tokens.inputTokens)}`);
+  }
+  if (tokens.outputTokens > 0) {
+    parts.push(`${t('format.out')}: ${formatTokens(tokens.outputTokens)}`);
+  }
+  if (tokens.cacheCreationTokens > 0) {
+    parts.push(`C·W: ${formatTokens(tokens.cacheCreationTokens)}`);
+  }
+  if (tokens.cacheReadTokens > 0) {
+    parts.push(`C·R: ${formatTokens(tokens.cacheReadTokens)}`);
   }
 
-  const parts: string[] = [
-    `${t('format.in')}: ${formatTokens(tokens.inputTokens)}`,
-    `${t('format.out')}: ${formatTokens(tokens.outputTokens)}`,
-  ];
-
-  if (tokens.cacheCreationTokens > 0 || tokens.cacheReadTokens > 0) {
-    parts.push(`${t('format.cache')}: ${formatTokens(tokens.cacheCreationTokens + tokens.cacheReadTokens)}`);
-  }
-
-  return `${prefix} ${formatTokens(total)} (${parts.join(', ')})`;
+  return parts.length > 0
+    ? `${prefix} ${formatTokens(total)} (${parts.join(', ')})`
+    : `${prefix} ${formatTokens(total)}`;
 }
 
 export function renderSessionTokensLine(ctx: RenderContext): string | null {
