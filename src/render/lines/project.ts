@@ -137,7 +137,7 @@ export function renderProjectLine(ctx: RenderContext): string | null {
   }
 
   if (display?.showDuration === true && ctx.sessionDuration) {
-    parts.push(label(`⏱️  ${ctx.sessionDuration}`, colors));
+    parts.push(label(`⏱️ ${ctx.sessionDuration}`, colors));
   }
 
   const costEstimate = renderCostEstimate(ctx);
