@@ -6,6 +6,12 @@ import { formatTokens } from '../../utils/format.js';
 const TEAL = '\x1b[38;5;73m';
 const GRAY = '\x1b[38;5;243m';
 
+function hitPctColor(percent: number): string {
+  if (percent >= 85) return '\x1b[38;5;107m';
+  if (percent >= 70) return '\x1b[38;5;179m';
+  return '\x1b[38;5;167m';
+}
+
 export function formatSessionTokenSummary(
   tokens: NonNullable<RenderContext['transcript']['sessionTokens']>,
   prefix: string,
@@ -23,7 +29,12 @@ export function formatSessionTokenSummary(
     parts.push(`${TEAL}C·W${RESET} ${GRAY}${formatTokens(tokens.cacheCreationTokens)}${RESET}`);
   }
   if (tokens.cacheReadTokens > 0) {
-    parts.push(`${TEAL}C·R${RESET} ${GRAY}${formatTokens(tokens.cacheReadTokens)}${RESET}`);
+    const inputTotal = tokens.inputTokens + tokens.cacheCreationTokens + tokens.cacheReadTokens;
+    const hitPercent = Math.round((tokens.cacheReadTokens / inputTotal) * 1000) / 10;
+    parts.push(
+      `${TEAL}C·R${RESET} ${GRAY}${formatTokens(tokens.cacheReadTokens)} ` +
+      `(${hitPctColor(hitPercent)}${hitPercent}%${RESET}${GRAY})${RESET}`,
+    );
   }
 
   const head = `${TEAL}${prefix}${RESET} ${GRAY}${formatTokens(total)}${RESET}`;
