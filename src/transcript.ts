@@ -1,62 +1,38 @@
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
 import * as readline from 'node:readline';
 import { createHash } from 'node:crypto';
 import { getHudPluginDir } from './claude-config-dir.js';
 import { createDebug } from './debug.js';
-import type { TranscriptData, ToolEntry, AgentEntry, TodoItem, SessionTokenUsage } from './types.js';
+import type { AgentEntry, SessionTokenUsage, TodoItem, ToolEntry, TranscriptData } from './types.js';
 import { sanitizeDisplayText } from './utils/sanitize.js';
 import { sanitizeTranscriptModel } from './model-source.js';
 
 const debug = createDebug('transcript');
 
-interface TranscriptLine {
-  timestamp?: string;
-  type?: string;
-  subtype?: string;
-  operation?: string;
-  content?: string;
-  slug?: string;
-  customTitle?: string;
-  // Top-level field stamped onto every assistant record after `/advisor` is
-  // set. Holds the canonical advisor model ID (e.g. "claude-opus-4-7").
-  advisorModel?: string;
-  message?: {
-    id?: unknown;
-    // Usually an array of content blocks, but slash-command records (e.g.
-    // `/effort`) store their output as a raw string.
-    content?: ContentBlock[] | string;
-    model?: unknown;
-    usage?: {
-      input_tokens?: number;
-      output_tokens?: number;
-      cache_creation_input_tokens?: number;
-      cache_read_input_tokens?: number;
-    };
-  };
-  // Result payload the harness stamps onto the record carrying a tool_result
-  // block. For Agent calls it reports `resolvedModel`, the model the subagent
-  // actually runs on — the only source when the caller inherits the session
-  // model instead of passing `model` explicitly.
-  toolUseResult?: {
-    resolvedModel?: unknown;
-  };
-  compactMetadata?: {
-    trigger?: string;
-    preTokens?: number;
-    postTokens?: number;
-    durationMs?: number;
-  };
-  // Harness state markers; `ultra_effort_enter` / `ultra_effort_exit` track
-  // entering / leaving ultracode effort.
-  attachment?: {
-    type?: string;
-  };
+const TOOLS_KEPT = 20;
+const AGENTS_KEPT = 10;
+// Tools are tracked beyond those shown so an MCP call's late error still counts, but
+// bounded so the saved parser state stays small however long the session runs.
+const TOOLS_TRACKED = 256;
+const NAME_MAX_LEN = 64;
+const ADVISOR_MODEL_MAX_LEN = 64;
+const MESSAGE_ID_MAX_LEN = 128;
+const MESSAGE_IDS_MAX = 4096;
+const MCP_ERRORS_MAX = 64;
+const MCP_TOOL = /^mcp__(.+?)__(.+)$/;
+// Claude Code's /effort output; anchored so prose quoting it can't flip ultracode.
+const EFFORT_COMMAND = /^<local-command-stdout>Set effort level to (\w+)/;
+
+interface Usage {
+  input_tokens?: unknown;
+  output_tokens?: unknown;
+  cache_creation_input_tokens?: unknown;
+  cache_read_input_tokens?: unknown;
 }
 
-interface ContentBlock {
-  type: string;
+interface Block {
+  type?: string;
   id?: string;
   name?: string;
   input?: Record<string, unknown>;
@@ -64,734 +40,67 @@ interface ContentBlock {
   is_error?: boolean;
 }
 
-interface TranscriptFileState {
-  mtimeMs: number;
-  size: number;
+interface Entry {
+  type?: string;
+  subtype?: string;
+  operation?: string;
+  content?: unknown;
+  timestamp?: string;
+  isSidechain?: boolean;
+  advisorModel?: unknown;
+  message?: { id?: unknown; model?: unknown; content?: Block[] | string; usage?: Usage };
+  toolUseResult?: { resolvedModel?: unknown; isAsync?: unknown; status?: unknown };
+  compactMetadata?: { postTokens?: unknown };
+  attachment?: { type?: string; prompt?: unknown };
 }
 
-interface SerializedToolEntry extends Omit<ToolEntry, 'startTime' | 'endTime'> {
-  startTime: string;
-  endTime?: string;
+const emptyTranscript = (): TranscriptData => ({ tools: [], skills: [], mcpServers: [], mcpErrors: [], agents: [], todos: [] });
+
+const ZERO_USAGE: SessionTokenUsage = { inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
+const USAGE_FIELDS = Object.keys(ZERO_USAGE) as (keyof SessionTokenUsage)[];
+
+const count = (value: unknown): number =>
+  typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
+
+function addUsage(total: SessionTokenUsage, usage: SessionTokenUsage): void {
+  for (const field of USAGE_FIELDS) total[field] += usage[field];
 }
 
-interface SerializedAgentEntry extends Omit<AgentEntry, 'startTime' | 'endTime'> {
-  startTime: string;
-  endTime?: string;
+function name(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const text = sanitizeDisplayText(value).trim();
+  if (!text) return undefined;
+  return text.length <= NAME_MAX_LEN ? text : `${text.slice(0, NAME_MAX_LEN - 1)}…`;
 }
 
-interface SerializedTranscriptData {
-  tools: SerializedToolEntry[];
-  skills: string[];
-  mcpServers: string[];
-  agents: SerializedAgentEntry[];
-  todos: TodoItem[];
-  sessionStart?: string;
-  sessionName?: string;
-  lastAssistantResponseAt?: string;
-  sessionTokens?: SessionTokenUsage;
-  lastCompactBoundaryAt?: string;
-  lastCompactPostTokens?: number;
-  compactionCount?: number;
-  advisorModel?: string;
-  ultracodeActive?: boolean;
-  lastAssistantModel?: string;
-}
+const mcpServer = (toolName: string): string | undefined => name(MCP_TOOL.exec(toolName)?.[1]);
 
-interface TranscriptCacheFile {
-  version?: number;
-  transcriptPath: string;
-  transcriptState: TranscriptFileState;
-  data: SerializedTranscriptData;
-}
+// Tool inputs are written by the model, so their text is untrusted terminal input.
+const text = (value: unknown): string | undefined =>
+  typeof value === 'string' ? sanitizeDisplayText(value) || undefined : undefined;
 
-const TRANSCRIPT_CACHE_VERSION = 13;
-const MCP_TOOL_NAME_PATTERN = /^mcp__(.+?)__(.+)$/;
-const ACTIVITY_NAME_MAX_LEN = 64;
-const MESSAGE_ID_MAX_LEN = 128;
-const SEEN_MESSAGE_IDS_MAX = 4096;
-
-// Hard cap on the advisor model ID captured from the transcript. Real Claude
-// model IDs (e.g. "claude-haiku-4-5-20251001") fit comfortably under this; the
-// cap exists to prevent a malformed transcript from persisting an oversized
-// string through the JSON cache and onto every statusline refresh.
-const ADVISOR_MODEL_MAX_LEN = 64;
-
-let createReadStreamImpl: typeof fs.createReadStream = fs.createReadStream;
-
-function normalizeTokenCount(value: unknown): number {
-  if (typeof value !== 'number' || !Number.isFinite(value)) {
-    return 0;
-  }
-
-  return Math.max(0, Math.trunc(value));
-}
-
-function normalizeMessageId(value: unknown): string | null {
-  return typeof value === 'string' && value.length > 0 && value.length <= MESSAGE_ID_MAX_LEN
-    ? value
-    : null;
-}
-
-function rememberMessageId(seenMessageIds: Set<string>, messageId: string): void {
-  if (seenMessageIds.size >= SEEN_MESSAGE_IDS_MAX) {
-    const oldest = seenMessageIds.values().next().value;
-    if (oldest !== undefined) {
-      seenMessageIds.delete(oldest);
-    }
-  }
-  seenMessageIds.add(messageId);
-}
-
-function normalizeSessionTokens(tokens: unknown): SessionTokenUsage | undefined {
-  if (!tokens || typeof tokens !== 'object') {
-    return undefined;
-  }
-
-  const raw = tokens as Record<string, unknown>;
-  return {
-    inputTokens: normalizeTokenCount(raw.inputTokens),
-    outputTokens: normalizeTokenCount(raw.outputTokens),
-    cacheCreationTokens: normalizeTokenCount(raw.cacheCreationTokens),
-    cacheReadTokens: normalizeTokenCount(raw.cacheReadTokens),
-  };
-}
-
-function normalizeNameList(value: unknown): string[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  const seen = new Set<string>();
-  const names: string[] = [];
-  for (const item of value) {
-    const name = normalizeActivityName(item);
-    if (!name || seen.has(name)) {
-      continue;
-    }
-    seen.add(name);
-    names.push(name);
-  }
-
-  return names;
-}
-
-function normalizeActivityName(value: unknown): string | undefined {
-  if (typeof value !== 'string') {
-    return undefined;
-  }
-
-  const sanitized = sanitizeDisplayText(value).trim();
-
-  if (!sanitized) {
-    return undefined;
-  }
-
-  if (sanitized.length <= ACTIVITY_NAME_MAX_LEN) {
-    return sanitized;
-  }
-
-  return `${sanitized.slice(0, ACTIVITY_NAME_MAX_LEN - 1)}…`;
-}
-
-function getTranscriptCachePath(transcriptPath: string, homeDir: string): string {
-  const hash = createHash('sha256').update(path.resolve(transcriptPath)).digest('hex');
-  return path.join(getHudPluginDir(homeDir), 'transcript-cache', `${hash}.json`);
-}
-
-function canonicalizeTranscriptPath(transcriptPath: string): string | null {
-  try {
-    return fs.realpathSync(transcriptPath);
-  } catch (err) {
-    debug('Failed to resolve transcript path %s:', transcriptPath, err instanceof Error ? err.message : err);
-    return null;
-  }
-}
-
-function readTranscriptFileState(transcriptPath: string): TranscriptFileState | null {
-  try {
-    const stat = fs.statSync(transcriptPath);
-    if (!stat.isFile()) {
-      debug('Transcript path is not a file: %s', transcriptPath);
-      return null;
-    }
-    return {
-      mtimeMs: stat.mtimeMs,
-      size: stat.size,
-    };
-  } catch (err) {
-    debug('Failed to stat transcript file %s:', transcriptPath, err instanceof Error ? err.message : err);
-    return null;
-  }
-}
-
-function serializeTranscriptData(data: TranscriptData): SerializedTranscriptData {
-  return {
-    tools: data.tools.map((tool) => ({
-      ...tool,
-      startTime: tool.startTime.toISOString(),
-      endTime: tool.endTime?.toISOString(),
-    })),
-    skills: [...data.skills],
-    mcpServers: [...data.mcpServers],
-    agents: data.agents.map((agent) => ({
-      ...agent,
-      startTime: agent.startTime.toISOString(),
-      endTime: agent.endTime?.toISOString(),
-    })),
-    todos: data.todos.map((todo) => ({ ...todo })),
-    sessionStart: data.sessionStart?.toISOString(),
-    sessionName: data.sessionName,
-    lastAssistantResponseAt: data.lastAssistantResponseAt?.toISOString(),
-    sessionTokens: data.sessionTokens,
-    lastCompactBoundaryAt: data.lastCompactBoundaryAt?.toISOString(),
-    lastCompactPostTokens: data.lastCompactPostTokens,
-    compactionCount: data.compactionCount,
-    advisorModel: data.advisorModel,
-    ultracodeActive: data.ultracodeActive,
-    lastAssistantModel: sanitizeTranscriptModel(data.lastAssistantModel),
-  };
-}
-
-function deserializeTranscriptData(data: SerializedTranscriptData): TranscriptData {
-  return {
-    tools: data.tools.map((tool) => ({
-      ...tool,
-      startTime: new Date(tool.startTime),
-      endTime: tool.endTime ? new Date(tool.endTime) : undefined,
-    })),
-    skills: normalizeNameList(data.skills),
-    mcpServers: normalizeNameList(data.mcpServers),
-    agents: data.agents.map((agent) => ({
-      ...agent,
-      model: sanitizeTranscriptModel(agent.model),
-      startTime: new Date(agent.startTime),
-      endTime: agent.endTime ? new Date(agent.endTime) : undefined,
-    })),
-    todos: data.todos.map((todo) => ({ ...todo })),
-    sessionStart: data.sessionStart ? new Date(data.sessionStart) : undefined,
-    sessionName: data.sessionName,
-    lastAssistantResponseAt: data.lastAssistantResponseAt ? new Date(data.lastAssistantResponseAt) : undefined,
-    sessionTokens: normalizeSessionTokens(data.sessionTokens),
-    lastCompactBoundaryAt: data.lastCompactBoundaryAt ? new Date(data.lastCompactBoundaryAt) : undefined,
-    lastCompactPostTokens: typeof data.lastCompactPostTokens === 'number' ? data.lastCompactPostTokens : undefined,
-    compactionCount: typeof data.compactionCount === 'number' && Number.isFinite(data.compactionCount) && data.compactionCount >= 0
-      ? Math.trunc(data.compactionCount)
-      : undefined,
-    advisorModel: typeof data.advisorModel === 'string' && data.advisorModel.length > 0
-      ? data.advisorModel.slice(0, ADVISOR_MODEL_MAX_LEN)
-      : undefined,
-    ultracodeActive: typeof data.ultracodeActive === 'boolean' ? data.ultracodeActive : undefined,
-    lastAssistantModel: sanitizeTranscriptModel(data.lastAssistantModel),
-  };
-}
-
-function readTranscriptCache(transcriptPath: string, state: TranscriptFileState): TranscriptData | null {
-  try {
-    const cachePath = getTranscriptCachePath(transcriptPath, os.homedir());
-    const raw = fs.readFileSync(cachePath, 'utf8');
-    const parsed = JSON.parse(raw) as TranscriptCacheFile;
-    if (
-      parsed.version !== TRANSCRIPT_CACHE_VERSION
-      || !parsed.data
-      || !parsed.transcriptPath
-      || parsed.transcriptPath !== path.resolve(transcriptPath)
-      || parsed.transcriptState?.mtimeMs !== state.mtimeMs
-      || parsed.transcriptState?.size !== state.size
-    ) {
-      return null;
-    }
-
-    return deserializeTranscriptData(parsed.data);
-  } catch (err) {
-    debug('Failed to read transcript cache:', err instanceof Error ? err.message : err);
-    return null;
-  }
-}
-
-function writeTranscriptCache(transcriptPath: string, state: TranscriptFileState, data: TranscriptData): void {
-  try {
-    const cachePath = getTranscriptCachePath(transcriptPath, os.homedir());
-    const cacheDir = path.dirname(cachePath);
-    fs.mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
-    try {
-      fs.chmodSync(cacheDir, 0o700);
-    } catch {
-      // Best-effort: some filesystems do not support POSIX modes.
-    }
-    const payload: TranscriptCacheFile = {
-      version: TRANSCRIPT_CACHE_VERSION,
-      transcriptPath: path.resolve(transcriptPath),
-      transcriptState: state,
-      data: serializeTranscriptData(data),
-    };
-    fs.writeFileSync(cachePath, JSON.stringify(payload), { encoding: 'utf8', mode: 0o600 });
-    try {
-      fs.chmodSync(cachePath, 0o600);
-    } catch {
-      // Best-effort: cache permissions should not break rendering.
-    }
-  } catch (err) {
-    debug('Failed to write transcript cache:', err instanceof Error ? err.message : err);
-  }
-}
-
-export async function parseTranscript(transcriptPath: string): Promise<TranscriptData> {
-  const result: TranscriptData = {
-    tools: [],
-    skills: [],
-    mcpServers: [],
-    agents: [],
-    todos: [],
-  };
-
-  if (!transcriptPath || !fs.existsSync(transcriptPath)) {
-    return result;
-  }
-
-  const canonicalTranscriptPath = canonicalizeTranscriptPath(transcriptPath);
-  if (!canonicalTranscriptPath) {
-    return result;
-  }
-
-  const transcriptState = readTranscriptFileState(canonicalTranscriptPath);
-  if (!transcriptState) {
-    return result;
-  }
-
-  const cached = readTranscriptCache(canonicalTranscriptPath, transcriptState);
-  if (cached) {
-    return cached;
-  }
-
-  const toolMap = new Map<string, ToolEntry>();
-  const skillSet = new Set<string>();
-  const mcpServerSet = new Set<string>();
-  const agentMap = new Map<string, AgentEntry>();
-  let latestTodos: TodoItem[] = [];
-  const taskIdToIndex = new Map<string, number>();
-  const queueCompletionMap = new Map<string, Date>();
-  let latestSlug: string | undefined;
-  let customTitle: string | undefined;
-  let latestAdvisorModel: string | undefined;
-  let latestUltracodeActive: boolean | undefined;
-  let lastCompactBoundaryAt: Date | undefined;
-  let lastCompactPostTokens: number | undefined;
-  let compactionCount = 0;
-  const sessionTokens: SessionTokenUsage = {
-    inputTokens: 0,
-    outputTokens: 0,
-    cacheCreationTokens: 0,
-    cacheReadTokens: 0,
-  };
-  const seenMessageIds = new Set<string>();
-  let lastUsageKey: string | undefined;
-
-  let parsedCleanly = false;
-
-  try {
-    const fileStream = createReadStreamImpl(canonicalTranscriptPath);
-    const rl = readline.createInterface({
-      input: fileStream,
-      crlfDelay: Infinity,
-    });
-
-    for await (const line of rl) {
-      if (!line.trim()) {
-        lastUsageKey = undefined;
-        continue;
-      }
-
-      try {
-        const entry = JSON.parse(line) as TranscriptLine;
-        if (entry.type === 'custom-title' && typeof entry.customTitle === 'string') {
-          customTitle = entry.customTitle;
-        } else if (typeof entry.slug === 'string') {
-          latestSlug = entry.slug;
-        }
-        // Capture the advisor model from the top-level `advisorModel` field.
-        // Claude Code stamps this onto every *assistant* record after `/advisor`
-        // is set, so we restrict to that record type (matching the documented
-        // source) and the most recent occurrence reflects the current choice.
-        // Length is hard-capped so a malformed transcript cannot persist an
-        // unbounded value through the cache layer.
-        if (
-          entry.type === 'assistant'
-          && typeof entry.advisorModel === 'string'
-          && entry.advisorModel.length > 0
-        ) {
-          latestAdvisorModel = entry.advisorModel.slice(0, ADVISOR_MODEL_MAX_LEN);
-        }
-        // Current ultracode state, distinguishable only from the transcript
-        // (stdin reports it as plain `xhigh`). Two signals update this in file
-        // order, last wins: the self-correcting ultra_effort_enter/exit
-        // attachment (can lag a turn) and the immediate `/effort` command output.
-        if (entry.type === 'attachment') {
-          const attachmentType = entry.attachment?.type;
-          if (attachmentType === 'ultra_effort_enter') {
-            latestUltracodeActive = true;
-          } else if (attachmentType === 'ultra_effort_exit') {
-            latestUltracodeActive = false;
-          }
-        }
-        // The `/effort` command-output signal. Anchored at the start of a *user*
-        // record's string content, so prose quoting the phrase can't flip state.
-        // Brittle by necessity — couples to Claude Code's /effort wording; if that
-        // changes, the label falls back to the (laggier) attachments.
-        if (entry.type === 'user' && typeof entry.message?.content === 'string') {
-          const effortCommandMatch = entry.message.content.match(
-            /^<local-command-stdout>Set effort level to (\w+)/,
-          );
-          if (effortCommandMatch) {
-            latestUltracodeActive = effortCommandMatch[1].toLowerCase() === 'ultracode';
-          }
-        }
-        // Capture the actual model from the assistant message's `model` field.
-        // This reflects what the API actually served, which may differ from the
-        // model Claude Code thinks it's using (e.g. proxy redirect via cc-switch).
-        if (entry.type === 'assistant') {
-          const transcriptModel = sanitizeTranscriptModel(entry.message?.model);
-          if (transcriptModel) {
-            result.lastAssistantModel = transcriptModel;
-          }
-        }
-        // Accumulate token usage from assistant messages.
-        // Claude Code can write the same API response to the transcript 2-3 times
-        // (dual-logging). Prefer the API-response-level message.id so duplicates
-        // can be removed even when another record appears between them. Only
-        // bounded string IDs are retained, and the set is capped to keep a
-        // malformed transcript from growing memory without limit. Records with
-        // missing or invalid IDs keep the previous consecutive usage-fingerprint
-        // fallback.
-        if (entry.type === 'assistant' && entry.message?.usage) {
-          const usage = entry.message.usage;
-          const msgId = normalizeMessageId(entry.message.id);
-          let shouldCount = false;
-
-          if (msgId !== null) {
-            lastUsageKey = undefined;
-            if (!seenMessageIds.has(msgId)) {
-              rememberMessageId(seenMessageIds, msgId);
-              shouldCount = true;
-            }
-          } else {
-            const usageKey = `${usage.input_tokens}|${usage.output_tokens}|${usage.cache_creation_input_tokens}|${usage.cache_read_input_tokens}`;
-            shouldCount = usageKey !== lastUsageKey;
-            lastUsageKey = usageKey;
-          }
-
-          if (shouldCount) {
-            sessionTokens.inputTokens += normalizeTokenCount(usage.input_tokens);
-            sessionTokens.outputTokens += normalizeTokenCount(usage.output_tokens);
-            sessionTokens.cacheCreationTokens += normalizeTokenCount(usage.cache_creation_input_tokens);
-            sessionTokens.cacheReadTokens += normalizeTokenCount(usage.cache_read_input_tokens);
-          }
-        } else {
-          lastUsageKey = undefined;
-        }
-        // Track Claude Code's compact_boundary marker. Both manual (/compact)
-        // and auto compaction emit this system entry with compactMetadata; we
-        // take the most recent one's timestamp so callers can distinguish a
-        // legitimate post-compact zero frame from a transient stdin glitch.
-        if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
-          const ts = entry.timestamp ? new Date(entry.timestamp) : null;
-          if (ts && !Number.isNaN(ts.getTime())) {
-            compactionCount += 1;
-            if (!lastCompactBoundaryAt || ts.getTime() > lastCompactBoundaryAt.getTime()) {
-              lastCompactBoundaryAt = ts;
-              const post = entry.compactMetadata?.postTokens;
-              lastCompactPostTokens = typeof post === 'number' && Number.isFinite(post) && post >= 0
-                ? Math.trunc(post)
-                : undefined;
-            }
-          }
-        }
-        // Capture accurate background-agent completion timestamps from queue-operation entries.
-        // The tool_result timestamp in the parent transcript is written at launch time, not
-        // when the agent actually finishes, so we override with the enqueue timestamp.
-        if (entry.type === 'queue-operation' && entry.operation === 'enqueue' && entry.content) {
-          const taskIdMatch = entry.content.match(/<task-id>([^<]+)<\/task-id>/);
-          const toolUseIdMatch = entry.content.match(/<tool-use-id>([^<]+)<\/tool-use-id>/);
-          if (taskIdMatch && toolUseIdMatch && entry.timestamp) {
-            const ts = new Date(entry.timestamp);
-            if (!Number.isNaN(ts.getTime())) {
-              queueCompletionMap.set(toolUseIdMatch[1], ts);
-            }
-          }
-        }
-        processEntry(entry, toolMap, skillSet, mcpServerSet, agentMap, taskIdToIndex, latestTodos, result);
-      } catch (err) {
-        lastUsageKey = undefined;
-        debug('Skipping malformed transcript line:', err instanceof Error ? err.message : err);
-      }
-    }
-
-    parsedCleanly = true;
-  } catch (err) {
-    debug('Transcript stream read error, returning partial results:', err instanceof Error ? err.message : err);
-  }
-
-  // Resolve agent completion: prefer queue-operation timestamps (accurate for
-  // background agents), fall back to tool_result timestamps (inline agents).
-  // Status is deferred so background agents show ◐ until they truly finish.
-  for (const [toolUseId, endTime] of queueCompletionMap) {
-    const agent = agentMap.get(toolUseId);
-    if (agent?.background) {
-      agent.endTime = endTime;
-      agent.status = 'completed';
-    }
-  }
-  for (const agent of agentMap.values()) {
-    if (agent.status === 'running' && agent.endTime) {
-      agent.status = 'completed';
-    }
-  }
-  result.tools = Array.from(toolMap.values()).slice(-20);
-  result.skills = Array.from(skillSet.values());
-  result.mcpServers = Array.from(mcpServerSet.values());
-  result.agents = Array.from(agentMap.values()).slice(-10);
-  result.todos = latestTodos;
-  result.sessionName = customTitle ?? latestSlug;
-  result.sessionTokens = sessionTokens;
-  result.lastCompactBoundaryAt = lastCompactBoundaryAt;
-  result.lastCompactPostTokens = lastCompactPostTokens;
-  result.compactionCount = compactionCount;
-  result.advisorModel = latestAdvisorModel;
-  result.ultracodeActive = latestUltracodeActive;
-  if (parsedCleanly) {
-    writeTranscriptCache(canonicalTranscriptPath, transcriptState, result);
-  }
-
-  return result;
-}
-
-export function _setCreateReadStreamForTests(impl: typeof fs.createReadStream | null): void {
-  createReadStreamImpl = impl ?? fs.createReadStream;
-}
-
-function processEntry(
-  entry: TranscriptLine,
-  toolMap: Map<string, ToolEntry>,
-  skillSet: Set<string>,
-  mcpServerSet: Set<string>,
-  agentMap: Map<string, AgentEntry>,
-  taskIdToIndex: Map<string, number>,
-  latestTodos: TodoItem[],
-  result: TranscriptData
-): void {
-  const timestamp = entry.timestamp ? new Date(entry.timestamp) : new Date();
-  const hasValidTimestamp = !Number.isNaN(timestamp.getTime());
-
-  if (!result.sessionStart && entry.timestamp && hasValidTimestamp) {
-    result.sessionStart = timestamp;
-  }
-
-  if (entry.type === 'assistant' && entry.timestamp && hasValidTimestamp) {
-    result.lastAssistantResponseAt = timestamp;
-  }
-
-  const content = entry.message?.content;
-  if (!content || !Array.isArray(content)) return;
-
-  for (const block of content) {
-    if (block.type === 'tool_use' && block.id && block.name) {
-      const skillName = block.name === 'Skill'
-        ? normalizeSkillName(block.input?.skill)
-        : undefined;
-      if (skillName) {
-        skillSet.add(skillName);
-      }
-
-      const mcpServerName = extractMcpServerName(block.name);
-      if (mcpServerName) {
-        mcpServerSet.add(mcpServerName);
-      }
-
-      const toolEntry: ToolEntry = {
-        id: block.id,
-        name: block.name,
-        target: extractTarget(block.name, block.input),
-        status: 'running',
-        startTime: timestamp,
-      };
-
-      if (block.name === 'Task' || block.name === 'Agent') {
-        const input = block.input as Record<string, unknown>;
-        const agentEntry: AgentEntry = {
-          id: block.id,
-          type: (input?.subagent_type as string) ?? 'agent',
-          model: sanitizeTranscriptModel(input?.model),
-          description: (input?.description as string) ?? undefined,
-          status: 'running',
-          startTime: timestamp,
-          background: (input?.run_in_background as boolean) === true,
-        };
-        agentMap.set(block.id, agentEntry);
-      } else if (block.name === 'TodoWrite') {
-        const input = block.input as { todos?: TodoItem[] };
-        if (input?.todos && Array.isArray(input.todos)) {
-          // Build a FIFO queue of taskIds per content string, ordered by the
-          // old array position. Two todos that share the same content must
-          // each get their own taskId back after the rebuild, so we cannot
-          // collapse duplicates to one index.
-          const contentToTaskIds = new Map<string, string[]>();
-          const taskIdsByOldIndex: Array<[number, string]> = [];
-          for (const [taskId, idx] of taskIdToIndex) {
-            if (idx < latestTodos.length) {
-              taskIdsByOldIndex.push([idx, taskId]);
-            }
-          }
-          taskIdsByOldIndex.sort((a, b) => a[0] - b[0]);
-          for (const [idx, taskId] of taskIdsByOldIndex) {
-            const content = latestTodos[idx].content;
-            const ids = contentToTaskIds.get(content) ?? [];
-            ids.push(taskId);
-            contentToTaskIds.set(content, ids);
-          }
-
-          latestTodos.length = 0;
-          taskIdToIndex.clear();
-          latestTodos.push(...input.todos);
-
-          // Consume one queued taskId per new todo that matches by content,
-          // so duplicate-content items still each get their own taskId.
-          for (let i = 0; i < latestTodos.length; i++) {
-            const ids = contentToTaskIds.get(latestTodos[i].content);
-            if (ids && ids.length > 0) {
-              const taskId = ids.shift() as string;
-              taskIdToIndex.set(taskId, i);
-              if (ids.length === 0) {
-                contentToTaskIds.delete(latestTodos[i].content);
-              }
-            }
-          }
-        }
-      } else if (block.name === 'TaskCreate') {
-        const input = block.input as Record<string, unknown>;
-        const subject = typeof input?.subject === 'string' ? input.subject : '';
-        const description = typeof input?.description === 'string' ? input.description : '';
-        const content = subject || description || 'Untitled task';
-        const status = normalizeTaskStatus(input?.status) ?? 'pending';
-        latestTodos.push({ content, status });
-
-        const rawTaskId = input?.taskId;
-        const taskId = typeof rawTaskId === 'string' || typeof rawTaskId === 'number'
-          ? String(rawTaskId)
-          : block.id;
-        if (taskId) {
-          taskIdToIndex.set(taskId, latestTodos.length - 1);
-        }
-      } else if (block.name === 'TaskUpdate') {
-        const input = block.input as Record<string, unknown>;
-        const index = resolveTaskIndex(input?.taskId, taskIdToIndex, latestTodos);
-        if (index !== null) {
-          const status = normalizeTaskStatus(input?.status);
-          if (status) {
-            latestTodos[index].status = status;
-          }
-
-          const subject = typeof input?.subject === 'string' ? input.subject : '';
-          const description = typeof input?.description === 'string' ? input.description : '';
-          const content = subject || description;
-          if (content) {
-            latestTodos[index].content = content;
-          }
-        }
-      } else {
-        toolMap.set(block.id, toolEntry);
-      }
-    }
-
-    if (block.type === 'tool_result' && block.tool_use_id) {
-      const tool = toolMap.get(block.tool_use_id);
-      if (tool) {
-        tool.status = block.is_error ? 'error' : 'completed';
-        tool.endTime = timestamp;
-      }
-
-      const agent = agentMap.get(block.tool_use_id);
-      if (agent) {
-        // `resolvedModel` is the model the subagent actually ran on, so it wins
-        // over the caller's `model` input (an alias like "opus", and absent
-        // entirely whenever the subagent inherits the session model).
-        const resolvedModel = sanitizeTranscriptModel(entry.toolUseResult?.resolvedModel);
-        if (resolvedModel) {
-          agent.model = resolvedModel;
-        }
-        if (!agent.background) {
-          agent.endTime = timestamp;
-        }
-      }
-    }
-  }
-}
-
-function extractTarget(toolName: string, input?: Record<string, unknown>): string | undefined {
+function toolTarget(toolName: string, input: Record<string, unknown> | undefined): string | undefined {
   if (!input) return undefined;
-
   switch (toolName) {
     case 'Read':
     case 'Write':
     case 'Edit':
-      return (input.file_path as string) ?? (input.path as string);
+      return text(input.file_path ?? input.path);
     case 'Glob':
-      return input.pattern as string;
     case 'Grep':
-      return input.pattern as string;
+      return text(input.pattern);
     case 'Skill':
-      return normalizeSkillName(input.skill);
-    case 'Bash':
-      if (typeof input.command !== 'string') {
-        return undefined;
-      }
-      const cmd = input.command.replace(/\s+/g, ' ').trim();
-      return cmd
-        ? cmd.length > 30
-          ? `${cmd.slice(0, 30).trimEnd()}...`
-          : cmd
-        : undefined;
+      return name(input.skill);
+    case 'Bash': {
+      const command = text(input.command)?.replace(/\s+/g, ' ').trim();
+      if (!command) return undefined;
+      return command.length > 30 ? `${command.slice(0, 30).trimEnd()}...` : command;
+    }
   }
   return undefined;
 }
 
-function normalizeSkillName(value: unknown): string | undefined {
-  return normalizeActivityName(value);
-}
-
-function extractMcpServerName(toolName: string): string | undefined {
-  const match = MCP_TOOL_NAME_PATTERN.exec(toolName);
-  if (!match) {
-    return undefined;
-  }
-
-  return normalizeActivityName(match[1]);
-}
-
-function resolveTaskIndex(
-  taskId: unknown,
-  taskIdToIndex: Map<string, number>,
-  latestTodos: TodoItem[]
-): number | null {
-  if (typeof taskId === 'string' || typeof taskId === 'number') {
-    const key = String(taskId);
-    const mapped = taskIdToIndex.get(key);
-    if (typeof mapped === 'number') {
-      return mapped;
-    }
-
-    if (/^\d+$/.test(key)) {
-      const numericIndex = Number.parseInt(key, 10) - 1;
-      if (numericIndex >= 0 && numericIndex < latestTodos.length) {
-        return numericIndex;
-      }
-    }
-  }
-
-  return null;
-}
-
-function normalizeTaskStatus(status: unknown): TodoItem['status'] | null {
-  if (typeof status !== 'string') return null;
-
+function taskStatus(status: unknown): TodoItem['status'] | null {
   switch (status) {
     case 'pending':
     case 'not_started':
@@ -806,4 +115,543 @@ function normalizeTaskStatus(status: unknown): TodoItem['status'] | null {
     default:
       return null;
   }
+}
+
+function toTodo(value: unknown): TodoItem[] {
+  const todo = value as { content?: unknown; status?: unknown } | null;
+  const content = text(todo?.content);
+  const status = taskStatus(todo?.status);
+  return content && status ? [{ content, status }] : [];
+}
+
+class Parser {
+  // Every field must round-trip through save() and load(), or a resumed read loses it.
+  private tools = new Map<string, ToolEntry>();
+  private agents = new Map<string, AgentEntry>();
+  private skills = new Set<string>();
+  private mcpServers = new Set<string>();
+  private mcpErrors = new Set<string>();
+  private todos: TodoItem[] = [];
+  private taskIndex = new Map<string, number>();
+  private agentCompletions = new Map<string, Date>();
+  // Some task-notifications omit <tool-use-id>, carrying only <task-id> (= the
+  // launch toolUseResult's agentId). Map agentId -> toolUseId from the launch
+  // result so those notifications can still resolve completion.
+  private agentIdToToolUseId = new Map<string, string>();
+  // Claude Code logs one API response several times, sometimes non-adjacently, so usage
+  // is the per-field max per message id. Ids evicted to bound memory settle into `settled`.
+  private usageById = new Map<string, SessionTokenUsage>();
+  private settled: SessionTokenUsage = { ...ZERO_USAGE };
+  private lastIdlessUsage: string | undefined;
+  private data: TranscriptData = { ...emptyTranscript(), compactionCount: 0 };
+
+  line(raw: string): void {
+    let entry: Entry | null = null;
+    try {
+      entry = raw.trim() ? JSON.parse(raw) : null;
+    } catch {
+      // Malformed lines are skipped.
+    }
+    if (!entry || typeof entry !== 'object') {
+      this.lastIdlessUsage = undefined;
+      return;
+    }
+
+    const time = entry.timestamp ? new Date(entry.timestamp) : null;
+    const at = time && !Number.isNaN(time.getTime()) ? time : null;
+    if (at && !this.data.sessionStart) this.data.sessionStart = at;
+
+    if (entry.type === 'assistant') {
+      this.assistant(entry, at);
+    } else {
+      this.lastIdlessUsage = undefined;
+    }
+    if (entry.type === 'user' && typeof entry.message?.content === 'string') {
+      const effort = EFFORT_COMMAND.exec(entry.message.content);
+      if (effort) this.data.ultracodeActive = effort[1].toLowerCase() === 'ultracode';
+    }
+    if (entry.type === 'attachment') {
+      if (entry.attachment?.type === 'ultra_effort_enter') this.data.ultracodeActive = true;
+      if (entry.attachment?.type === 'ultra_effort_exit') this.data.ultracodeActive = false;
+    }
+    if (entry.type === 'system' && entry.subtype === 'compact_boundary' && at) {
+      this.data.compactionCount = (this.data.compactionCount ?? 0) + 1;
+      const post = entry.compactMetadata?.postTokens;
+      this.data.contextTokens = typeof post === 'number' && Number.isFinite(post) && post >= 0 ? Math.trunc(post) : undefined;
+    }
+    // A background agent's tool_result lands at launch; its completion is this enqueue,
+    // or (forked/resumed sessions) a queued_command attachment carrying the same notice.
+    const notice =
+      entry.type === 'queue-operation' && entry.operation === 'enqueue' ? entry.content
+      : entry.type === 'attachment' && entry.attachment?.type === 'queued_command' ? entry.attachment.prompt
+      : undefined;
+    if (typeof notice === 'string' && at) {
+      const taskId = /<task-id>([^<]+)<\/task-id>/.exec(notice)?.[1];
+      const toolUseId =
+        /<tool-use-id>([^<]+)<\/tool-use-id>/.exec(notice)?.[1] ??
+        (taskId ? this.agentIdToToolUseId.get(taskId) : undefined);
+      // Both carriers can log the same notice; the earliest is when the agent finished.
+      // Background Bash and Monitor tasks send the same notice; only agents' are kept.
+      const prev = toolUseId && this.agentCompletions.get(toolUseId);
+      if (toolUseId && taskId && this.agents.has(toolUseId) && !(prev && prev <= at)) this.agentCompletions.set(toolUseId, at);
+    }
+
+    if (Array.isArray(entry.message?.content)) {
+      for (const block of entry.message.content) {
+        if (block?.type === 'tool_use' && block.id && block.name) this.toolUse(block, at ?? new Date());
+        if (block?.type === 'tool_result' && block.tool_use_id) this.toolResult(block, entry, at ?? new Date());
+      }
+    }
+  }
+
+  private assistant(entry: Entry, at: Date | null): void {
+    if (at) this.data.lastAssistantResponseAt = at;
+    if (typeof entry.advisorModel === 'string' && entry.advisorModel) {
+      this.data.advisorModel = entry.advisorModel.slice(0, ADVISOR_MODEL_MAX_LEN);
+    }
+    const model = sanitizeTranscriptModel(entry.message?.model);
+    // Claude Code writes '<synthetic>' on assistant records it generates locally.
+    if (model && model !== '<synthetic>') this.data.lastAssistantModel = model;
+
+    const raw = entry.message?.usage;
+    if (!raw) {
+      this.lastIdlessUsage = undefined;
+      return;
+    }
+    const usage: SessionTokenUsage = {
+      inputTokens: count(raw.input_tokens),
+      outputTokens: count(raw.output_tokens),
+      cacheCreationTokens: count(raw.cache_creation_input_tokens),
+      cacheReadTokens: count(raw.cache_read_input_tokens),
+    };
+    // A main-conversation request always sends some context, so zero is a placeholder: gateways that
+    // write one record per content block give thinking blocks all-zero usage. Keep the last real size.
+    const contextTokens = usage.inputTokens + usage.cacheCreationTokens + usage.cacheReadTokens;
+    if (entry.isSidechain !== true && contextTokens > 0) {
+      this.data.contextTokens = contextTokens;
+    }
+
+    const id = entry.message?.id;
+    if (typeof id === 'string' && id && id.length <= MESSAGE_ID_MAX_LEN) {
+      this.lastIdlessUsage = undefined;
+      const previous = this.usageById.get(id);
+      this.usageById.set(id, previous ? maxUsage(previous, usage) : usage);
+      if (this.usageById.size > MESSAGE_IDS_MAX) {
+        const [oldestId, oldest] = this.usageById.entries().next().value as [string, SessionTokenUsage];
+        this.usageById.delete(oldestId);
+        addUsage(this.settled, oldest);
+      }
+      return;
+    }
+    // Without an id, only an identical record right after the previous one is a duplicate.
+    const fingerprint = JSON.stringify(usage);
+    if (fingerprint !== this.lastIdlessUsage) addUsage(this.settled, usage);
+    this.lastIdlessUsage = fingerprint;
+  }
+
+  private toolUse(block: Block, at: Date): void {
+    const toolName = block.name as string;
+    const input = block.input;
+    const skill = toolName === 'Skill' ? name(input?.skill) : undefined;
+    if (skill) this.skills.add(skill);
+    const server = mcpServer(toolName);
+    if (server) this.mcpServers.add(server);
+
+    if (toolName === 'Task' || toolName === 'Agent') {
+      this.agents.set(block.id as string, {
+        id: block.id as string,
+        type: (input?.subagent_type as string) ?? 'agent',
+        model: sanitizeTranscriptModel(input?.model),
+        description: (input?.description as string) ?? undefined,
+        status: 'running',
+        startTime: at,
+        background: input?.run_in_background === true,
+      });
+      if (cap(this.agents, AGENTS_KEPT)) {
+        // Completions and launch ids only matter for agents still tracked.
+        for (const id of this.agentCompletions.keys()) if (!this.agents.has(id)) this.agentCompletions.delete(id);
+        for (const [agentId, id] of this.agentIdToToolUseId) if (!this.agents.has(id)) this.agentIdToToolUseId.delete(agentId);
+      }
+    } else if (toolName === 'TodoWrite') {
+      if (Array.isArray(input?.todos)) this.replaceTodos(input.todos.flatMap(toTodo));
+    } else if (toolName === 'TaskCreate') {
+      const content = text(input?.subject) ?? text(input?.description);
+      this.todos.push({ content: content ?? 'Untitled task', status: taskStatus(input?.status) ?? 'pending' });
+      const taskId = typeof input?.taskId === 'string' || typeof input?.taskId === 'number' ? String(input.taskId) : block.id;
+      if (taskId) this.taskIndex.set(taskId, this.todos.length - 1);
+    } else if (toolName === 'TaskUpdate') {
+      const todo = this.todos[this.findTask(input?.taskId) ?? -1];
+      if (!todo) return;
+      const status = taskStatus(input?.status);
+      if (status) todo.status = status;
+      const content = text(input?.subject) ?? text(input?.description);
+      if (content) todo.content = content;
+    } else {
+      this.tools.set(block.id as string, {
+        id: block.id as string,
+        name: toolName,
+        target: toolTarget(toolName, input),
+        status: 'running',
+        startTime: at,
+      });
+      cap(this.tools, TOOLS_TRACKED);
+    }
+  }
+
+  private toolResult(block: Block, entry: Entry, at: Date): void {
+    const id = block.tool_use_id as string;
+    const tool = this.tools.get(id);
+    if (tool) {
+      tool.status = block.is_error ? 'error' : 'completed';
+      tool.endTime = at;
+      const server = mcpServer(tool.name);
+      if (server && block.is_error) {
+        this.mcpErrors.add(server);
+        cap(this.mcpErrors, MCP_ERRORS_MAX);
+      } else if (server) {
+        this.mcpErrors.delete(server);
+      }
+    }
+
+    const agent = this.agents.get(id);
+    if (agent) {
+      const agentId = (entry.toolUseResult as { agentId?: unknown } | undefined)?.agentId;
+      if (typeof agentId === 'string' && agentId) {
+        this.agentIdToToolUseId.set(agentId, id);
+        agent.agentId = agentId;
+      }
+      // resolvedModel is what the subagent actually ran on, so it beats the caller's alias.
+      agent.model = sanitizeTranscriptModel(entry.toolUseResult?.resolvedModel) ?? agent.model;
+      if (entry.toolUseResult?.isAsync === true || entry.toolUseResult?.status === 'async_launched') {
+        agent.background = true;
+      }
+      if (!agent.background) agent.endTime = at;
+    }
+  }
+
+  // TodoWrite replaces the list; TaskCreate ids follow their todo by content, in order,
+  // so duplicate-content todos each keep their own id.
+  private replaceTodos(next: TodoItem[]): void {
+    const idsByContent = new Map<string, string[]>();
+    for (const [taskId, index] of [...this.taskIndex].sort((a, b) => a[1] - b[1])) {
+      const content = this.todos[index]?.content;
+      if (content === undefined) continue;
+      idsByContent.set(content, [...(idsByContent.get(content) ?? []), taskId]);
+    }
+    this.todos = [...next];
+    this.taskIndex.clear();
+    this.todos.forEach((todo, index) => {
+      const taskId = idsByContent.get(todo.content)?.shift();
+      if (taskId) this.taskIndex.set(taskId, index);
+    });
+  }
+
+  // TaskUpdate names a task by the id TaskCreate returned, or by its 1-based position.
+  private findTask(taskId: unknown): number | null {
+    if (typeof taskId !== 'string' && typeof taskId !== 'number') return null;
+    const key = String(taskId);
+    const mapped = this.taskIndex.get(key);
+    if (mapped !== undefined) return mapped;
+    const position = /^\d+$/.test(key) ? Number(key) - 1 : -1;
+    return position >= 0 && position < this.todos.length ? position : null;
+  }
+
+  // Maps and Sets become arrays so the state round-trips through JSON.
+  save() {
+    return {
+      tools: [...this.tools],
+      agents: [...this.agents],
+      skills: [...this.skills],
+      mcpServers: [...this.mcpServers],
+      mcpErrors: [...this.mcpErrors],
+      todos: this.todos,
+      taskIndex: [...this.taskIndex],
+      agentCompletions: [...this.agentCompletions],
+      agentIdToToolUseId: [...this.agentIdToToolUseId],
+      usageById: [...this.usageById],
+      settled: this.settled,
+      lastIdlessUsage: this.lastIdlessUsage,
+      data: this.data,
+    };
+  }
+
+  // `s` comes from JSON read with reviveDates; Map entries are [key, value] pairs the
+  // reviver can't see, so their Dates are rebuilt here.
+  static load(s: SavedState): Parser {
+    const parser = new Parser();
+    parser.tools = new Map(s.tools);
+    parser.agents = new Map(s.agents);
+    parser.skills = new Set(s.skills);
+    parser.mcpServers = new Set(s.mcpServers);
+    parser.mcpErrors = new Set(s.mcpErrors);
+    parser.todos = s.todos;
+    parser.taskIndex = new Map(s.taskIndex);
+    parser.agentCompletions = new Map(s.agentCompletions.map(([id, at]) => [id, new Date(at)]));
+    parser.agentIdToToolUseId = new Map(s.agentIdToToolUseId);
+    parser.usageById = new Map(s.usageById);
+    parser.settled = s.settled;
+    parser.lastIdlessUsage = s.lastIdlessUsage;
+    parser.data = s.data;
+    return parser;
+  }
+
+  finish(): TranscriptData {
+    for (const [id, endTime] of this.agentCompletions) {
+      const agent = this.agents.get(id);
+      if (agent?.background) agent.endTime = endTime;
+    }
+    for (const agent of this.agents.values()) {
+      if (agent.endTime) agent.status = 'completed';
+    }
+    const sessionTokens = { ...this.settled };
+    for (const usage of this.usageById.values()) addUsage(sessionTokens, usage);
+    return {
+      ...this.data,
+      tools: [...this.tools.values()].slice(-TOOLS_KEPT),
+      agents: [...this.agents.values()],
+      skills: [...this.skills],
+      mcpServers: [...this.mcpServers],
+      mcpErrors: [...this.mcpErrors],
+      todos: this.todos,
+      sessionTokens,
+    };
+  }
+}
+
+// The Date fields of ToolEntry, AgentEntry, and TranscriptData.
+const DATE_KEYS = new Set(['startTime', 'endTime', 'sessionStart', 'lastAssistantResponseAt']);
+type SavedState = ReturnType<Parser['save']>;
+const reviveDates = (key: string, value: unknown): unknown =>
+  DATE_KEYS.has(key) && typeof value === 'string' ? new Date(value) : value;
+
+/** Drops the oldest entries past `max`, returning whether any went. */
+function cap<K>(collection: Map<K, unknown> | Set<K>, max: number): boolean {
+  const over = collection.size > max;
+  for (const key of collection.keys()) {
+    if (collection.size <= max) break;
+    collection.delete(key);
+  }
+  return over;
+}
+
+function maxUsage(a: SessionTokenUsage, b: SessionTokenUsage): SessionTokenUsage {
+  return {
+    inputTokens: Math.max(a.inputTokens, b.inputTokens),
+    outputTokens: Math.max(a.outputTokens, b.outputTokens),
+    cacheCreationTokens: Math.max(a.cacheCreationTokens, b.cacheCreationTokens),
+    cacheReadTokens: Math.max(a.cacheReadTokens, b.cacheReadTokens),
+  };
+}
+
+// A transcript only grows, and a long session's runs to hundreds of MB, so each run
+// resumes from the last one's saved parser state instead of rereading the file (#816).
+interface Cursor {
+  version: string;
+  ino: number;
+  // Byte offset just past the last complete line the saved state has seen.
+  offset: number;
+  state: SavedState;
+}
+
+const CURSORS_KEPT = 32;
+const CHUNK_BYTES = 1 << 20;
+// A first read of a huge file can outlast Claude Code's wait, so it saves as it goes
+// and the next run carries on from there.
+const CHECKPOINT_BYTES = 32 << 20;
+const NEWLINE = 0x0a;
+
+// A release may parse differently, so its state starts over.
+let hudVersion: string | undefined;
+function getHudVersion(): string {
+  if (hudVersion === undefined) {
+    try {
+      hudVersion = String(JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version);
+    } catch {
+      hudVersion = '';
+    }
+  }
+  return hudVersion;
+}
+
+function cursorPath(homeDir: string, transcriptPath: string): string {
+  const key = createHash('sha256').update(path.resolve(transcriptPath)).digest('hex');
+  return path.join(getHudPluginDir(homeDir), 'transcript-cursors', `${key}.json`);
+}
+
+function readCursor(file: string): Cursor | null {
+  let cursor: Partial<Cursor> | null;
+  try {
+    cursor = JSON.parse(fs.readFileSync(file, 'utf8'), reviveDates);
+  } catch {
+    return null;
+  }
+  if (typeof cursor !== 'object' || cursor === null) return null;
+  if (cursor.version !== getHudVersion() || typeof cursor.ino !== 'number') return null;
+  if (typeof cursor.offset !== 'number' || !Number.isSafeInteger(cursor.offset) || cursor.offset < 0) return null;
+  return cursor as Cursor;
+}
+
+function writeCursor(file: string, cursor: Cursor): void {
+  try {
+    const dir = path.dirname(file);
+    const isNew = !fs.existsSync(file);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(cursor), { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    if (isNew) pruneCursors(dir);
+  } catch (err) {
+    // Without a cursor the next run just rereads the whole file.
+    debug('Transcript cursor write failed:', err instanceof Error ? err.message : err);
+  }
+}
+
+// Keeps the 32 most recently written files, stray temp files from a killed run included.
+function pruneCursors(dir: string): void {
+  const files = fs.readdirSync(dir).map((name) => path.join(dir, name));
+  if (files.length <= CURSORS_KEPT) return;
+  const byAge = files.map((file) => ({ file, mtime: fs.statSync(file).mtimeMs })).sort((a, b) => a.mtime - b.mtime);
+  for (const { file } of byAge.slice(0, files.length - CURSORS_KEPT)) fs.rmSync(file, { force: true });
+}
+
+// The saved state still fits the file only if it is the same file, no shorter, and the
+// offset still sits just past a newline (a rewritten file usually breaks that).
+async function resumes(file: fs.promises.FileHandle, stat: fs.Stats, cursor: Cursor): Promise<boolean> {
+  if (cursor.ino !== stat.ino || cursor.offset > stat.size) return false;
+  if (cursor.offset === 0) return true;
+  const { bytesRead, buffer } = await file.read(Buffer.alloc(1), 0, 1, cursor.offset - 1);
+  return bytesRead === 1 && buffer[0] === NEWLINE;
+}
+
+/**
+ * Feeds each complete line from `start` on, with the offset just past it. Returns the
+ * offset after the last newline and the unterminated rest.
+ */
+async function readLines(
+  file: fs.promises.FileHandle,
+  start: number,
+  onLine: (line: string, end: number) => void,
+): Promise<{ end: number; rest: string }> {
+  const buffer = Buffer.alloc(CHUNK_BYTES);
+  let pending: Buffer[] = [];
+  let end = start;
+  let position = start;
+  while (true) {
+    let bytesRead: number;
+    try {
+      ({ bytesRead } = await file.read(buffer, 0, CHUNK_BYTES, position));
+    } catch (err) {
+      // A read cut short still renders, and saves, what was parsed.
+      debug('Transcript read failed:', err instanceof Error ? err.message : err);
+      break;
+    }
+    if (bytesRead === 0) break;
+    const chunk = buffer.subarray(0, bytesRead);
+    let from = 0;
+    let newline: number;
+    while ((newline = chunk.indexOf(NEWLINE, from)) !== -1) {
+      const piece = chunk.subarray(from, newline);
+      end = position + newline + 1;
+      onLine((pending.length > 0 ? Buffer.concat([...pending, piece]) : piece).toString('utf8'), end);
+      pending = [];
+      from = newline + 1;
+    }
+    // Copied, since the buffer is reused for the next chunk.
+    if (from < bytesRead) pending.push(Buffer.from(chunk.subarray(from)));
+    position += bytesRead;
+  }
+  return { end, rest: Buffer.concat(pending).toString('utf8') };
+}
+
+/** Parses from `offset` to the end, saving the state as it goes. */
+async function parseFrom(
+  file: fs.promises.FileHandle,
+  parser: Parser,
+  offset: number,
+  save: (parser: Parser, offset: number) => void,
+): Promise<TranscriptData> {
+  let saved = offset;
+  const { end, rest } = await readLines(file, offset, (line, lineEnd) => {
+    parser.line(line);
+    if (lineEnd - saved >= CHECKPOINT_BYTES) {
+      save(parser, lineEnd);
+      saved = lineEnd;
+    }
+  });
+  if (end > saved) save(parser, end);
+  // An unterminated last line may still be being written: it counts for this
+  // render but isn't saved, and the next run reads it again once it ends.
+  if (rest) parser.line(rest);
+  return parser.finish();
+}
+
+export async function parseTranscript(transcriptPath: string, homeDir: string): Promise<TranscriptData> {
+  let file: fs.promises.FileHandle;
+  try {
+    // Checked before opening, which would block on a pipe.
+    if (!transcriptPath || !(await fs.promises.stat(transcriptPath)).isFile()) return emptyTranscript();
+    file = await fs.promises.open(transcriptPath, 'r');
+  } catch {
+    return emptyTranscript();
+  }
+  try {
+    const stat = await file.stat();
+    const cursorFile = cursorPath(homeDir, transcriptPath);
+    const save = (parser: Parser, offset: number): void =>
+      writeCursor(cursorFile, { version: getHudVersion(), ino: stat.ino, offset, state: parser.save() });
+    const cursor = readCursor(cursorFile);
+    if (cursor && (await resumes(file, stat, cursor))) {
+      try {
+        return await parseFrom(file, Parser.load(cursor.state), cursor.offset, save);
+      } catch (err) {
+        debug('Saved transcript state unusable, rereading:', err instanceof Error ? err.message : err);
+      }
+    }
+    return await parseFrom(file, new Parser(), 0, save);
+  } catch (err) {
+    debug('Transcript read failed:', err instanceof Error ? err.message : err);
+    return emptyTranscript();
+  } finally {
+    await file.close();
+  }
+}
+
+// The id comes from the transcript and names a file, so only a plain token is used.
+const AGENT_ID = /^[\w-]{1,64}$/;
+
+/** A subagent's effort, from the first assistant record of `<session>/subagents/agent-<id>.jsonl`. */
+async function subagentEffort(transcriptPath: string, agentId: string): Promise<string | undefined> {
+  if (!AGENT_ID.test(agentId)) return undefined;
+  const file = path.join(path.dirname(transcriptPath), path.basename(transcriptPath, '.jsonl'), 'subagents', `agent-${agentId}.jsonl`);
+  try {
+    // Checked before opening, which would block on a pipe.
+    if (!(await fs.promises.stat(file)).isFile()) return undefined;
+  } catch {
+    return undefined;
+  }
+  // A stream rather than readLines, so the scan stops at the first reply.
+  const input = fs.createReadStream(file);
+  try {
+    for await (const raw of readline.createInterface({ input, crlfDelay: Infinity })) {
+      let entry: { type?: unknown; effort?: unknown } | null = null;
+      try {
+        entry = JSON.parse(raw);
+      } catch {
+        continue;
+      }
+      if (entry?.type === 'assistant') return typeof entry.effort === 'string' ? entry.effort : undefined;
+    }
+  } catch {
+    // Gone mid-read.
+  } finally {
+    input.destroy();
+  }
+  return undefined;
+}
+
+/** Sets each agent's effort in place; agents without a known id or first reply stay without one. */
+export async function addSubagentEfforts(transcriptPath: string, agents: AgentEntry[]): Promise<void> {
+  await Promise.all(agents.map(async (agent) => {
+    if (agent.agentId) agent.effort = await subagentEffort(transcriptPath, agent.agentId);
+  }));
 }

@@ -5,7 +5,8 @@ import { sanitizeDisplayText } from './utils/sanitize.js';
 
 /**
  * Authentication info for the current Claude Code login, derived from the
- * `oauthAccount` block Claude Code persists in {CLAUDE_CONFIG_DIR}.json.
+ * `oauthAccount` block Claude Code persists in ~/.claude.json, or
+ * $CLAUDE_CONFIG_DIR/.claude.json when the config directory is overridden.
  *
  *   method: human-readable auth/plan label (e.g. "Claude Max 20x", "API Key")
  *   user:   account identifier (email local part, falling back to displayName)
@@ -17,6 +18,7 @@ export interface AuthInfo {
 
 const EMPTY_AUTH_INFO: AuthInfo = { method: null, user: null };
 const API_KEY_AUTH_INFO: AuthInfo = { method: 'API Key', user: null };
+const AUTH_VALUE_MAX_LEN = 128;
 
 function hasApiKey(env: NodeJS.ProcessEnv): boolean {
   return typeof env.ANTHROPIC_API_KEY === 'string' && env.ANTHROPIC_API_KEY.trim().length > 0;
@@ -25,7 +27,7 @@ function hasApiKey(env: NodeJS.ProcessEnv): boolean {
 // Strip ANSI sequences and control/bidi characters so values from
 // claude.json can never smuggle escape sequences into the terminal.
 function sanitizeValue(value: string): string {
-  return sanitizeDisplayText(value).trim();
+  return sanitizeDisplayText(value).trim().slice(0, AUTH_VALUE_MAX_LEN);
 }
 
 function readString(obj: Record<string, unknown>, key: string): string | null {
@@ -59,7 +61,7 @@ function extractTierSuffix(rateLimitTier: string): string | null {
 }
 
 /**
- * Derives auth info from the parsed contents of {CLAUDE_CONFIG_DIR}.json.
+ * Derives auth info from the parsed contents of claude.json.
  * Pure so it can be tested without touching the filesystem.
  */
 export function deriveAuthInfo(claudeJson: unknown, env: NodeJS.ProcessEnv = process.env): AuthInfo {
@@ -97,17 +99,19 @@ export function deriveAuthInfo(claudeJson: unknown, env: NodeJS.ProcessEnv = pro
   return { method, user };
 }
 
-/** Reads auth info for the current login. Never throws. */
+/**
+ * Cache of the two DERIVED fields, keyed on the source file's identity.
+ *
+ * The identity combines mtime, ctime, size, device, and inode so a replacement
+ * or rapid rewrite cannot reuse a stale entry based on one timestamp alone.
+ */
 export function readAuthInfo(): AuthInfo {
-  // Avoid reading a stale OAuth profile when the active source is an API key.
+  // An API key wins over whatever OAuth profile claude.json still holds.
   if (hasApiKey(process.env)) {
     return API_KEY_AUTH_INFO;
   }
-
   try {
-    const configJsonPath = getClaudeConfigJsonPath(os.homedir());
-    const content = fs.readFileSync(configJsonPath, 'utf-8');
-    return deriveAuthInfo(JSON.parse(content));
+    return deriveAuthInfo(JSON.parse(fs.readFileSync(getClaudeConfigJsonPath(os.homedir()), 'utf8')));
   } catch {
     return EMPTY_AUTH_INFO;
   }

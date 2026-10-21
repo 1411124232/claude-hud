@@ -1,8 +1,13 @@
 import type { HudConfig } from './config.js';
-import type { GitStatus } from './git.js';
+import type { GitRepoIdentity, GitStatus } from './git.js';
 import type { AuthInfo } from './auth.js';
+import type { CostTotals } from './daily-cost.js';
 
+// The statusline payload Claude Code writes to stdin (code.claude.com/docs/en/statusline).
 export interface StdinData {
+  session_id?: string;
+  session_name?: string;
+  version?: string;
   transcript_path?: string;
   cwd?: string;
   workspace?: {
@@ -10,11 +15,13 @@ export interface StdinData {
     project_dir?: string;
     added_dirs?: string[];
     git_worktree?: string;
+    repo?: GitRepoIdentity;
   } | null;
   model?: {
     id?: string;
     display_name?: string;
   };
+  output_style?: { name?: string };
   context_window?: {
     context_window_size?: number;
     total_input_tokens?: number | null;
@@ -25,7 +32,6 @@ export interface StdinData {
       cache_creation_input_tokens?: number;
       cache_read_input_tokens?: number;
     } | null;
-    // Native percentage fields (Claude Code v2.1.6+)
     used_percentage?: number | null;
     remaining_percentage?: number | null;
   };
@@ -37,31 +43,24 @@ export interface StdinData {
     total_lines_removed?: number | null;
   } | null;
   rate_limits?: {
-    five_hour?: {
-      used_percentage?: number | null;
-      resets_at?: number | null;
-    } | null;
-    seven_day?: {
-      used_percentage?: number | null;
-      resets_at?: number | null;
-    } | null;
-    /**
-     * Model-scoped weekly windows (e.g. the Fable weekly quota shown on /usage).
-     * Additive field — Claude Code's internal status schema defines it as
-     * { display_name, utilization (0-100 percent), resets_at (ISO-8601) } and only
-     * includes it when the server returns per-model windows.
-     */
-    model_scoped?: Array<{
-      display_name?: string | null;
-      utilization?: number | null;
-      resets_at?: string | null;
-    }> | null;
+    five_hour?: RateLimitWindow | null;
+    seven_day?: RateLimitWindow | null;
+    spend_limit?: RateLimitWindow | null;
   } | null;
-  // Claude Code 2.1.115+ exposes effort as an object: { level: "max" }.
-  // Earlier versions (≤2.1.114) did not send this field at all. The bare-string
-  // shape is kept for backwards compatibility with the original PR #471 design
-  // that future-proofed a string form before Anthropic had committed a schema.
-  effort?: string | { level?: string | null; [key: string]: unknown } | null;
+  prompt_cache?: {
+    warm?: boolean;
+    caching_observed?: boolean;
+    ttl?: string;
+    expires_at?: number | null;
+    hit_ratio?: number | null;
+  } | null;
+  effort?: { level?: string } | null;
+  worktree?: { name?: string; path?: string; branch?: string } | null;
+}
+
+interface RateLimitWindow {
+  used_percentage?: number | null;
+  resets_at?: number | null;
 }
 
 export interface ToolEntry {
@@ -82,6 +81,10 @@ export interface AgentEntry {
   startTime: Date;
   endTime?: Date;
   background?: boolean;
+  // Claude Code's id for the subagent, from its tool_result; names its own transcript.
+  agentId?: string;
+  // Read from that transcript when display.showAgentEffort is on.
+  effort?: string;
 }
 
 export interface TodoItem {
@@ -95,7 +98,7 @@ export interface UsageData {
   fiveHourResetAt: Date | null;
   sevenDayResetAt: Date | null;
   balanceLabel?: string | null;  // optional raw balance text (e.g. "¥6.35")
-  /** Model-scoped weekly windows (e.g. Fable) from stdin rate_limits.model_scoped. */
+  // Model-scoped weekly windows (e.g. Fable), from the external usage snapshot.
   scopedWindows?: ScopedUsageWindow[];
 }
 
@@ -117,6 +120,12 @@ export interface ExternalUsageSnapshot {
   } | null;
   updated_at?: string | number | null;
   balance_label?: string | null;
+  // Model-scoped weekly windows (e.g. Fable), in the shape of Claude Code's /usage data.
+  model_scoped?: Array<{
+    display_name?: string | null;
+    utilization?: number | null;
+    resets_at?: string | null;
+  }> | null;
 }
 
 export interface MemoryInfo {
@@ -142,17 +151,25 @@ export interface TranscriptData {
   tools: ToolEntry[];
   skills: string[];
   mcpServers: string[];
+  /**
+   * MCP servers whose latest observed tool result is an error, derived
+   * from `mcp__<server>__<tool>` results carrying is_error. Distinct from
+   * mcpServers, which is a plain activity list.
+   */
+  mcpErrors: string[];
   agents: AgentEntry[];
   todos: TodoItem[];
   sessionStart?: Date;
-  sessionName?: string;
+  // Last assistant response of any kind, subagents included. Drives the
+  // last-response element.
   lastAssistantResponseAt?: Date;
   sessionTokens?: SessionTokenUsage;
-  lastCompactBoundaryAt?: Date;
-  lastCompactPostTokens?: number;
   // Number of compact_boundary entries (manual /compact or auto compaction)
   // with a valid timestamp seen in the transcript.
   compactionCount?: number;
+  // Tokens in the main conversation's context as of its last request, or the
+  // post-compaction size after a compact boundary.
+  contextTokens?: number;
   // Advisor model ID for the current session, captured from the top-level
   // `advisorModel` field that Claude Code stamps onto every assistant record
   // after `/advisor` is set (e.g. "claude-opus-4-7"). undefined when /advisor
@@ -176,17 +193,12 @@ export interface RenderContext {
   rulesCount: number;
   mcpCount: number;
   hooksCount: number;
-  sessionDuration: string;
+  costTotals: CostTotals | null;
+  outputSpeed: number | null;
   gitStatus: GitStatus | null;
   usageData: UsageData | null;
   memoryUsage: MemoryInfo | null;
   config: HudConfig;
   extraLabel: string | null;
-  outputStyle?: string;
-  claudeCodeVersion?: string;
-  effortLevel?: string;
-  effortSymbol?: string;
-  // Auth method + account for the current login (see auth.ts). Only populated
-  // when display.showAuth or display.showAuthUser is enabled.
   authInfo?: AuthInfo | null;
 }

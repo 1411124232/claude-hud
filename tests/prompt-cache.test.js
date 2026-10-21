@@ -1,68 +1,46 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { formatPromptCacheCountdown, renderPromptCacheLine } from '../dist/render/lines/prompt-cache.js';
+import { promptCacheLine } from '../dist/render/lines.js';
 import { setLanguage } from '../dist/i18n/index.js';
 
-function stripAnsi(str) {
-  // eslint-disable-next-line no-control-regex
-  return str.replace(/\x1b\[[0-9;]*m/g, '');
-}
+const NOW = Date.UTC(2026, 9, 1, 12, 0, 0);
+const strip = (s) => s?.replace(/\x1b\[[0-9;]*m/g, '');
+const pad = (n) => String(n).padStart(2, '0');
+const clock = (secondsFromNow, seconds = false) => {
+  const d = new Date(NOW + secondsFromNow * 1000);
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}${seconds ? `:${pad(d.getSeconds())}` : ''}`;
+};
 
-function baseContext() {
+function ctx(cache, display = {}) {
   return {
-    stdin: {},
-    transcript: { tools: [], agents: [], todos: [] },
-    claudeMdCount: 0,
-    rulesCount: 0,
-    mcpCount: 0,
-    hooksCount: 0,
-    sessionDuration: '',
-    gitStatus: null,
-    usageData: null,
-    memoryUsage: null,
-    config: {
-      display: {
-        showPromptCache: true,
-        promptCacheTtlSeconds: 300,
-      },
-      colors: {},
-    },
-    extraLabel: null,
+    stdin: { prompt_cache: cache },
+    config: { display: { showPromptCache: true, hourCycle: 'h23', ...display }, colors: {} },
+    now: NOW,
   };
 }
+const warm = (secondsLeft, ttl = '5m') => ({ caching_observed: true, warm: true, ttl, expires_at: NOW / 1000 + secondsLeft });
 
-test('formatPromptCacheCountdown formats minutes and seconds', () => {
-  assert.equal(formatPromptCacheCountdown(272_000), '4m 32s');
+test('the prompt cache line is hidden when off, absent, or caching was never observed', () => {
+  assert.equal(promptCacheLine(ctx(warm(200), { showPromptCache: false })), null);
+  assert.equal(promptCacheLine(ctx(undefined)), null);
+  assert.equal(promptCacheLine(ctx({ caching_observed: false })), null);
 });
 
-test('formatPromptCacheCountdown formats hours when needed', () => {
-  assert.equal(formatPromptCacheCountdown(3_632_000), '1h 0m 32s');
+test('the prompt cache line shows the expiry time and warns near the end of the TTL', () => {
+  const active = promptCacheLine(ctx(warm(240)));
+  assert.equal(strip(active), `Cache ⏱ until ${clock(240)}`);
+  const warning = promptCacheLine(ctx(warm(30)));
+  assert.equal(strip(warning), `Cache ⏱ until ${clock(30)}`);
+  assert.notEqual(active, warning, 'the last fifth of the TTL is coloured as a warning');
+  assert.equal(strip(promptCacheLine(ctx(warm(600, '1h'), { showClockSeconds: true }))), `Cache ⏱ until ${clock(600, true)}`);
 });
 
-test('formatPromptCacheCountdown returns expired when countdown has elapsed', () => {
-  assert.equal(formatPromptCacheCountdown(0), 'expired');
-  assert.equal(formatPromptCacheCountdown(-1000), 'expired');
-});
-
-test('renderPromptCacheLine shows warning and expired states', () => {
-  const ctx = baseContext();
-  const now = Date.UTC(2024, 0, 1, 0, 5, 0);
-
-  ctx.transcript.lastAssistantResponseAt = new Date(now - 280_000);
-  assert.equal(stripAnsi(renderPromptCacheLine(ctx, now) ?? ''), 'Cache ⏱ 0m 20s');
-
-  ctx.transcript.lastAssistantResponseAt = new Date(now - 301_000);
-  assert.equal(stripAnsi(renderPromptCacheLine(ctx, now) ?? ''), 'Cache ⏱ expired');
-});
-
-test('renderPromptCacheLine localizes label and expired state', () => {
-  const ctx = baseContext();
-  const now = Date.UTC(2024, 0, 1, 0, 5, 1);
-  ctx.transcript.lastAssistantResponseAt = new Date(now - 301_000);
-
-  setLanguage('zh');
+test('the prompt cache line reads expired once cold or past expires_at', () => {
+  assert.equal(strip(promptCacheLine(ctx(warm(-1)))), 'Cache ⏱ expired');
+  assert.equal(strip(promptCacheLine(ctx({ ...warm(200), warm: false }))), 'Cache ⏱ expired');
+  setLanguage('zh-Hans');
   try {
-    assert.equal(stripAnsi(renderPromptCacheLine(ctx, now) ?? ''), '缓存 ⏱ 已过期');
+    assert.equal(strip(promptCacheLine(ctx(warm(-1)))), '缓存 ⏱ 已过期');
   } finally {
     setLanguage('en');
   }
